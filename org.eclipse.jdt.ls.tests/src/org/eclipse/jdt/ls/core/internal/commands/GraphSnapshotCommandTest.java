@@ -170,21 +170,75 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 		}
 		IClasspathEntry[] original = javaProject.getRawClasspath();
 		IClasspathEntry[] withLibrary = Arrays.copyOf(original, original.length + 1);
-		withLibrary[original.length] = libraryEntry(library, "internal/**");
+		withLibrary[original.length] =
+				libraryEntry(library, "internal/**", IAccessRule.K_NON_ACCESSIBLE, false);
 		javaProject.setRawClasspath(withLibrary, monitor);
-		Map<String, Object> first = GraphSnapshotCommand.execute(monitor);
-		withLibrary[original.length] = libraryEntry(library, "public/**");
+		Map<String, Object> baseline = GraphSnapshotCommand.execute(monitor);
+		withLibrary[original.length] =
+				libraryEntry(library, "public/**", IAccessRule.K_NON_ACCESSIBLE, false);
 		javaProject.setRawClasspath(withLibrary, monitor);
-		Map<String, Object> changed = GraphSnapshotCommand.execute(monitor);
-		assertNotEquals(first.get("universe"), changed.get("universe"));
+		Map<String, Object> patternChanged = GraphSnapshotCommand.execute(monitor);
+		withLibrary[original.length] =
+				libraryEntry(library, "public/**", IAccessRule.K_DISCOURAGED, false);
+		javaProject.setRawClasspath(withLibrary, monitor);
+		Map<String, Object> kindChanged = GraphSnapshotCommand.execute(monitor);
+		withLibrary[original.length] =
+				libraryEntry(library, "public/**", IAccessRule.K_DISCOURAGED, true);
+		javaProject.setRawClasspath(withLibrary, monitor);
+		Map<String, Object> ignoreChanged = GraphSnapshotCommand.execute(monitor);
+		assertNotEquals(baseline.get("universe"), patternChanged.get("universe"));
+		assertNotEquals(patternChanged.get("universe"), kindChanged.get("universe"));
+		assertNotEquals(kindChanged.get("universe"), ignoreChanged.get("universe"));
 		assertTrue(
-				rows(changed, "projects").stream()
+				rows(ignoreChanged, "projects").stream()
 						.flatMap(row -> rows(row, "classpath").stream())
 						.filter(row -> String.valueOf(row.get("path")).endsWith("access-rules.jar"))
-						.anyMatch(row -> rowsOfStrings(row, "accessRules").stream().anyMatch(value -> value.contains("public/**"))));
+						.anyMatch(
+								row -> rowsOfStrings(row, "accessRules").stream()
+										.anyMatch(
+												value ->
+														value.contains("public/**")
+																&& value.endsWith(":true"))));
 	}
 
-	private static IClasspathEntry libraryEntry(java.nio.file.Path library, String pattern) {
+	@Test
+	public void projectClasspathCombinationMovesTheBuildUniverse() throws Exception {
+		importProjects("maven/multimodule");
+		IJavaProject javaProject =
+				Arrays.stream(JavaCore.create(WorkspaceHelper.getWorkspaceRoot()).getJavaProjects())
+						.filter(project -> {
+							try {
+								return Arrays.stream(project.getRawClasspath())
+										.anyMatch(entry -> entry.getEntryKind() == IClasspathEntry.CPE_PROJECT);
+							} catch (org.eclipse.jdt.core.JavaModelException exception) {
+								return false;
+							}
+						})
+						.findFirst()
+						.orElseThrow();
+		IClasspathEntry[] original = javaProject.getRawClasspath();
+		int index =
+				java.util.stream.IntStream.range(0, original.length)
+						.filter(value -> original[value].getEntryKind() == IClasspathEntry.CPE_PROJECT)
+						.findFirst()
+						.orElseThrow();
+		Map<String, Object> first = GraphSnapshotCommand.execute(monitor);
+		IClasspathEntry projectEntry = original[index];
+		IClasspathEntry[] changed = Arrays.copyOf(original, original.length);
+		changed[index] =
+				JavaCore.newProjectEntry(
+						projectEntry.getPath(),
+						projectEntry.getAccessRules(),
+						!projectEntry.combineAccessRules(),
+						projectEntry.getExtraAttributes(),
+						projectEntry.isExported());
+		javaProject.setRawClasspath(changed, monitor);
+		Map<String, Object> second = GraphSnapshotCommand.execute(monitor);
+		assertNotEquals(first.get("universe"), second.get("universe"));
+	}
+
+	private static IClasspathEntry libraryEntry(
+			java.nio.file.Path library, String pattern, int kind, boolean ignoreIfBetter) {
 		return JavaCore.newLibraryEntry(
 				new org.eclipse.core.runtime.Path(library.toString()),
 				null,
@@ -192,7 +246,7 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 				new IAccessRule[] {
 					JavaCore.newAccessRule(
 							new org.eclipse.core.runtime.Path(pattern),
-							IAccessRule.K_NON_ACCESSIBLE)
+							kind | (ignoreIfBetter ? IAccessRule.IGNORE_IF_BETTER : 0))
 				},
 				new org.eclipse.jdt.core.IClasspathAttribute[0],
 				false);

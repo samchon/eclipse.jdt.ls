@@ -436,6 +436,7 @@ public class NewCUProposal extends ChangeCorrectionProposalCore {
 			Lock lock = GraphSnapshotLock.writeLock();
 			lock.lock();
 			try {
+				GraphSnapshotLock.assertWriteLocked();
 				cu.becomeWorkingCopy(null);
 				try {
 					cu.getBuffer().setContents(cuContent);

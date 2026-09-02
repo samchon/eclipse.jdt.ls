@@ -30,4 +30,11 @@ public final class GraphSnapshotLock {
 	public static Lock writeLock() {
 		return LOCK.writeLock();
 	}
+
+	/** Fail closed if code mutates a default-owner working copy outside the lock. */
+	public static void assertWriteLocked() {
+		if (!LOCK.isWriteLockedByCurrentThread()) {
+			throw new IllegalStateException("A default-owner working copy changed outside the graph snapshot lock");
+		}
+	}
 }
