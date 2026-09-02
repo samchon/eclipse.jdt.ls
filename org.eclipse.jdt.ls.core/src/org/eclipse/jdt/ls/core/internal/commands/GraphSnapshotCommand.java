@@ -574,8 +574,14 @@ public final class GraphSnapshotCommand {
 			row.put("entryKind", entry.getEntryKind());
 			row.put("contentKind", entry.getContentKind());
 			row.put("exported", entry.isExported());
+			row.put("combineAccessRules", entry.combineAccessRules());
 			row.put("output", entry.getOutputLocation() == null ? "" : entry.getOutputLocation().toPortableString());
 			row.put("contentDigest", classpathDigest(entry, monitor));
+			row.put(
+					"accessRules",
+					Arrays.stream(entry.getAccessRules())
+							.map(rule -> rule.getKind() + ":" + rule.getPattern().toPortableString() + ":" + rule.ignoreIfBetter())
+							.toList());
 			List<String> attributes = Arrays.stream(entry.getExtraAttributes())
 					.sorted(Comparator.comparing(IClasspathAttribute::getName).thenComparing(IClasspathAttribute::getValue))
 					.map(attribute -> attribute.getName() + "=" + attribute.getValue()).toList();

@@ -19,12 +19,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.jar.JarOutputStream;
 
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IAccessRule;
+import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.ls.core.internal.GraphSnapshotLock;
@@ -89,7 +93,7 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 			assertEquals(sequence, ((Number) broken.get("sequence")).longValue());
 			assertTrue(rows(broken, "diagnostics").stream().anyMatch(row -> "error".equals(row.get("severity"))));
 
-			unit.getBuffer().setContents(resident + "// ?\n");
+			unit.getBuffer().setContents(resident + "// \u00e9\n");
 			Map<String, Object> unicode = GraphSnapshotCommand.execute(monitor);
 			unit.getBuffer().setContents(resident + "// ?\n");
 			Map<String, Object> question = GraphSnapshotCommand.execute(monitor);
@@ -152,6 +156,51 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 		importProjects("maven/modular-project");
 		Map<String, Object> snapshot = GraphSnapshotCommand.execute(monitor);
 		assertTrue(rows(snapshot, "nodes").stream().anyMatch(node -> "module".equals(node.get("kind"))));
+	}
+
+	@Test
+	public void classpathAccessRulesMoveTheBuildUniverse() throws Exception {
+		importProjects("maven/salut2");
+		IProject project = WorkspaceHelper.getProject("salut2");
+		IJavaProject javaProject = JavaCore.create(project);
+		java.nio.file.Path library = project.getLocation().append("lib/access-rules.jar").toFile().toPath();
+		java.nio.file.Files.createDirectories(library.getParent());
+		try (JarOutputStream ignored = new JarOutputStream(java.nio.file.Files.newOutputStream(library))) {
+			// An empty but valid archive is enough: only its access rules move below.
+		}
+		IClasspathEntry[] original = javaProject.getRawClasspath();
+		IClasspathEntry[] withLibrary = Arrays.copyOf(original, original.length + 1);
+		withLibrary[original.length] = libraryEntry(library, "internal/**");
+		javaProject.setRawClasspath(withLibrary, monitor);
+		Map<String, Object> first = GraphSnapshotCommand.execute(monitor);
+		withLibrary[original.length] = libraryEntry(library, "public/**");
+		javaProject.setRawClasspath(withLibrary, monitor);
+		Map<String, Object> changed = GraphSnapshotCommand.execute(monitor);
+		assertNotEquals(first.get("universe"), changed.get("universe"));
+		assertTrue(
+				rows(changed, "projects").stream()
+						.flatMap(row -> rows(row, "classpath").stream())
+						.filter(row -> String.valueOf(row.get("path")).endsWith("access-rules.jar"))
+						.anyMatch(row -> rowsOfStrings(row, "accessRules").stream().anyMatch(value -> value.contains("public/**"))));
+	}
+
+	private static IClasspathEntry libraryEntry(java.nio.file.Path library, String pattern) {
+		return JavaCore.newLibraryEntry(
+				new org.eclipse.core.runtime.Path(library.toString()),
+				null,
+				null,
+				new IAccessRule[] {
+					JavaCore.newAccessRule(
+							new org.eclipse.core.runtime.Path(pattern),
+							IAccessRule.K_NON_ACCESSIBLE)
+				},
+				new org.eclipse.jdt.core.IClasspathAttribute[0],
+				false);
+	}
+
+	@SuppressWarnings("unchecked")
+	private static List<String> rowsOfStrings(Map<String, Object> row, String key) {
+		return (List<String>) row.get(key);
 	}
 
 	private static Object sourceDigest(Map<String, Object> snapshot, IFile file) {
