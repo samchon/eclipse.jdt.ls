@@ -14,6 +14,7 @@ package org.eclipse.jdt.ls.core.internal.handlers;
 
 import java.util.Collections;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.locks.Lock;
 
 import org.eclipse.core.resources.IResource;
 import org.eclipse.core.resources.IWorkspaceRunnable;
@@ -30,6 +31,7 @@ import org.eclipse.jdt.core.manipulation.CoreASTProvider;
 import org.eclipse.jdt.internal.core.JavaModelManager;
 import org.eclipse.jdt.internal.core.OpenableElementInfo;
 import org.eclipse.jdt.internal.core.PackageFragment;
+import org.eclipse.jdt.ls.core.internal.GraphSnapshotLock;
 import org.eclipse.jdt.ls.core.internal.JDTUtils;
 import org.eclipse.jdt.ls.core.internal.JavaClientConnection;
 import org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin;
@@ -175,21 +177,28 @@ public class WorkspaceEventsHandler {
 	private void discardWorkingCopies(String parentUri) {
 		IPath parentPath = ResourceUtils.filePathFromURI(parentUri);
 		if (parentPath != null && !JDTUtils.isJavaFile(parentPath)) {
-			ICompilationUnit[] workingCopies = JavaCore.getWorkingCopies(null);
-			for (ICompilationUnit workingCopy : workingCopies) {
-				IResource resource = workingCopy.getResource();
-				if (resource == null) {
-					continue;
-				}
+			Lock lock = GraphSnapshotLock.writeLock();
+			lock.lock();
+			try {
+				GraphSnapshotLock.assertWriteLocked();
+				ICompilationUnit[] workingCopies = JavaCore.getWorkingCopies(null);
+				for (ICompilationUnit workingCopy : workingCopies) {
+					IResource resource = workingCopy.getResource();
+					if (resource == null) {
+						continue;
+					}
 
-				IPath cuPath = resource.getRawLocation() != null ? resource.getRawLocation() : resource.getLocation();
-				if (cuPath != null && parentPath.isPrefixOf(cuPath)) {
-					try {
-						workingCopy.discardWorkingCopy();
-					} catch (JavaModelException e) {
-						// do nothing.
+					IPath cuPath = resource.getRawLocation() != null ? resource.getRawLocation() : resource.getLocation();
+					if (cuPath != null && parentPath.isPrefixOf(cuPath)) {
+						try {
+							workingCopy.discardWorkingCopy();
+						} catch (JavaModelException e) {
+							// do nothing.
+						}
 					}
 				}
+			} finally {
+				lock.unlock();
 			}
 		}
 	}

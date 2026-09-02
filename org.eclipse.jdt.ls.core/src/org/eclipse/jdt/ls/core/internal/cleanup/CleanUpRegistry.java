@@ -19,6 +19,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.locks.Lock;
 
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.Status;
@@ -27,6 +28,7 @@ import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.ls.core.internal.GraphSnapshotLock;
 import org.eclipse.jdt.ls.core.internal.JDTUtils;
 import org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin;
 import org.eclipse.jdt.ui.cleanup.CleanUpContext;
@@ -124,7 +126,10 @@ public class CleanUpRegistry {
 		List<TextEdit> textEdits = new ArrayList<>();
 		ICompilationUnit cu = context.getCompilationUnit();
 
+		Lock lock = GraphSnapshotLock.writeLock();
+		lock.lock();
 		try {
+			GraphSnapshotLock.assertWriteLocked();
 			ICompilationUnit wc = cu.getWorkingCopy(monitor);
 			for (ISimpleCleanUp cleanUp : cleanUpsToRun) {
 				org.eclipse.text.edits.TextEdit jdtEdit = CleanUpUtils.getTextEditFromCleanUp(cleanUp, context, monitor);
@@ -146,6 +151,8 @@ public class CleanUpRegistry {
 
 		} catch (JavaModelException e) {
 			// continue
+		} finally {
+			lock.unlock();
 		}
 
 		return textEdits;
