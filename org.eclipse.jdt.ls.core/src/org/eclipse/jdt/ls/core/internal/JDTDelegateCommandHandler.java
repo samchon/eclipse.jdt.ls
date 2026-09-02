@@ -115,7 +115,8 @@ public class JDTDelegateCommandHandler implements IDelegateCommandHandler {
 				case "java.project.isTestFile":
 					return ProjectCommand.isTestFile((String) arguments.get(0));
 				case GraphSnapshotCommand.COMMAND_ID:
-					return GraphSnapshotCommand.execute(monitor);				case "java.project.getAll":
+					return GraphSnapshotCommand.execute(monitor);
+				case "java.project.getAll":
 					if (!arguments.isEmpty()) {
 						GetAllProjectOptions option = JSONUtility.toModel(arguments.get(0), GetAllProjectOptions.class);
 						if (option.includeNonJava) {

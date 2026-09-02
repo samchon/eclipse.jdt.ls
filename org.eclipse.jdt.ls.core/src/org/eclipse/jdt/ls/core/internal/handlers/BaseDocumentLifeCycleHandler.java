@@ -26,6 +26,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
 import java.util.stream.Stream;
 
 import org.eclipse.core.internal.resources.Workspace;
@@ -63,6 +64,7 @@ import org.eclipse.jdt.internal.core.OpenableElementInfo;
 import org.eclipse.jdt.internal.core.PackageFragment;
 import org.eclipse.jdt.internal.corext.util.JdtFlags;
 import org.eclipse.jdt.ls.core.internal.DocumentAdapter;
+import org.eclipse.jdt.ls.core.internal.GraphSnapshotLock;
 import org.eclipse.jdt.ls.core.internal.JDTUtils;
 import org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin;
 import org.eclipse.jdt.ls.core.internal.JobHelpers;
@@ -421,6 +423,16 @@ public abstract class BaseDocumentLifeCycleHandler {
 	}
 
 	public ICompilationUnit handleOpen(DidOpenTextDocumentParams params) {
+		Lock lock = GraphSnapshotLock.writeLock();
+		lock.lock();
+		try {
+			return handleOpenLocked(params);
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	private ICompilationUnit handleOpenLocked(DidOpenTextDocumentParams params) {
 		String uri = params.getTextDocument().getUri();
 		ICompilationUnit unit = resolveCompilationUnit(uri);
 		if (unit == null || unit.getResource() == null || unit.getResource().isDerived()) {
@@ -465,6 +477,16 @@ public abstract class BaseDocumentLifeCycleHandler {
 	}
 
 	public ICompilationUnit handleChanged(DidChangeTextDocumentParams params) {
+		Lock lock = GraphSnapshotLock.writeLock();
+		lock.lock();
+		try {
+			return handleChangedLocked(params);
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	private ICompilationUnit handleChangedLocked(DidChangeTextDocumentParams params) {
 		String uri = params.getTextDocument().getUri();
 		ICompilationUnit unit = JDTUtils.resolveCompilationUnit(uri);
 
@@ -536,6 +558,16 @@ public abstract class BaseDocumentLifeCycleHandler {
 	}
 
 	public ICompilationUnit handleClosed(DidCloseTextDocumentParams params) {
+		Lock lock = GraphSnapshotLock.writeLock();
+		lock.lock();
+		try {
+			return handleClosedLocked(params);
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	private ICompilationUnit handleClosedLocked(DidCloseTextDocumentParams params) {
 		String uri = params.getTextDocument().getUri();
 		ICompilationUnit unit = JDTUtils.resolveCompilationUnit(uri);
 		if (unit == null) {
@@ -577,6 +609,16 @@ public abstract class BaseDocumentLifeCycleHandler {
 	}
 
 	public ICompilationUnit handleSaved(DidSaveTextDocumentParams params) {
+		Lock lock = GraphSnapshotLock.writeLock();
+		lock.lock();
+		try {
+			return handleSavedLocked(params);
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	private ICompilationUnit handleSavedLocked(DidSaveTextDocumentParams params) {
 		String uri = params.getTextDocument().getUri();
 		ICompilationUnit unit = JDTUtils.resolveCompilationUnit(uri);
 		if (unit == null) {

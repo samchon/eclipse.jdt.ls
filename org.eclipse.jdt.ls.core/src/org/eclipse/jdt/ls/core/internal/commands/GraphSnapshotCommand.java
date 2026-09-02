@@ -15,7 +15,6 @@ package org.eclipse.jdt.ls.core.internal.commands;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -32,6 +31,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
 import java.util.stream.Stream;
 
 import org.eclipse.core.resources.IFile;
@@ -48,18 +48,38 @@ import org.eclipse.jdt.core.IBuffer;
 import org.eclipse.jdt.core.IClasspathAttribute;
 import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.ICompilationUnit;
-import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaModel;
 import org.eclipse.jdt.core.IJavaProject;
-import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IPackageFragment;
 import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.ISourceRange;
-import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
-import org.eclipse.jdt.core.Signature;
+import org.eclipse.jdt.core.compiler.IProblem;
+import org.eclipse.jdt.core.dom.AST;
+import org.eclipse.jdt.core.dom.ASTNode;
+import org.eclipse.jdt.core.dom.ASTVisitor;
+import org.eclipse.jdt.core.dom.AbstractTypeDeclaration;
+import org.eclipse.jdt.core.dom.AnnotationTypeDeclaration;
+import org.eclipse.jdt.core.dom.AnnotationTypeMemberDeclaration;
+import org.eclipse.jdt.core.dom.AnonymousClassDeclaration;
+import org.eclipse.jdt.core.dom.EnumConstantDeclaration;
+import org.eclipse.jdt.core.dom.EnumDeclaration;
+import org.eclipse.jdt.core.dom.IBinding;
+import org.eclipse.jdt.core.dom.IMethodBinding;
+import org.eclipse.jdt.core.dom.ITypeBinding;
+import org.eclipse.jdt.core.dom.IVariableBinding;
+import org.eclipse.jdt.core.dom.LambdaExpression;
+import org.eclipse.jdt.core.dom.MethodDeclaration;
+import org.eclipse.jdt.core.dom.ModuleDeclaration;
+import org.eclipse.jdt.core.dom.PackageDeclaration;
+import org.eclipse.jdt.core.dom.RecordDeclaration;
+import org.eclipse.jdt.core.dom.SingleVariableDeclaration;
+import org.eclipse.jdt.core.dom.TypeParameter;
+import org.eclipse.jdt.core.dom.TypeDeclaration;
+import org.eclipse.jdt.core.dom.VariableDeclaration;
+import org.eclipse.jdt.ls.core.internal.GraphSnapshotLock;
 import org.osgi.framework.Bundle;
 import org.osgi.framework.FrameworkUtil;
 
@@ -86,10 +106,22 @@ public final class GraphSnapshotCommand {
 
 	/** Capture and publish only after the complete generation has been built. */
 	public static synchronized Map<String, Object> execute(IProgressMonitor monitor) throws CoreException {
-		IWorkspace workspace = ResourcesPlugin.getWorkspace();
-		AtomicReference<Map<String, Object>> captured = new AtomicReference<>();
-		workspace.run(progress -> captured.set(capture(progress)), workspace.getRoot(), IWorkspace.AVOID_UPDATE, monitor);
-		Map<String, Object> snapshot = captured.get();
+		Lock lock = GraphSnapshotLock.readLock();
+		lock.lock();
+		Map<String, Object> snapshot;
+		try {
+			IWorkspace workspace = ResourcesPlugin.getWorkspace();
+			AtomicReference<Map<String, Object>> captured = new AtomicReference<>();
+			workspace.run(progress -> captured.set(capture(progress)), workspace.getRoot(), IWorkspace.AVOID_UPDATE, monitor);
+			snapshot = captured.get();
+		} finally {
+			lock.unlock();
+		}
+		if (!Boolean.TRUE.equals(snapshot.get("complete"))) {
+			snapshot.put("mode", "error");
+			snapshot.put("sequence", sequence);
+			return snapshot;
+		}
 		String universe = (String) snapshot.get("universe");
 		String generation = (String) snapshot.get("generation");
 		String mode;
@@ -119,6 +151,8 @@ public final class GraphSnapshotCommand {
 		List<Map<String, Object>> sources = new ArrayList<>();
 		List<Map<String, Object>> nodes = new ArrayList<>();
 		List<Map<String, Object>> edges = new ArrayList<>();
+		List<Map<String, Object>> diagnostics = new ArrayList<>();
+		Set<String> emittedNodes = new java.util.HashSet<>();
 
 		for (IJavaProject project : projectArray) {
 			checkCanceled(monitor);
@@ -128,23 +162,33 @@ public final class GraphSnapshotCommand {
 			projects.add(projectMetadata(project, monitor));
 			for (ICompilationUnit primary : sourceUnits(project, workingCopies)) {
 				checkCanceled(monitor);
-				ICompilationUnit unit = workingCopies.getOrDefault(unitKey(primary), primary);
-				if (unit.isWorkingCopy()) {
-					unit.reconcile(ICompilationUnit.NO_AST, true, null, monitor);
+				ICompilationUnit resident = workingCopies.get(unitKey(primary));
+				ICompilationUnit unit = resident == null ? primary.getWorkingCopy(monitor) : resident;
+				try {
+					org.eclipse.jdt.core.dom.CompilationUnit ast = unit.reconcile(AST.getJLSLatest(), true, null, monitor);
+					if (ast == null) {
+						throw failure("JDT did not reconcile " + unit.getPath().toPortableString(), null);
+					}
+					captureUnit(project, unit, ast, sources, nodes, edges, diagnostics, emittedNodes, monitor);
+				} finally {
+					if (resident == null) {
+						unit.discardWorkingCopy();
+					}
 				}
-				captureUnit(project, unit, sources, nodes, edges, monitor);
 			}
 		}
 
 		sources.sort(mapComparator("uri"));
 		nodes.sort(mapComparator("symbol", "uri"));
 		edges.sort(mapComparator("from", "to", "kind"));
+		diagnostics.sort(mapComparator("uri", "startLine", "startColumn", "code"));
 		String universe = digestValue(projects);
 		Map<String, Object> generationBody = map();
 		generationBody.put("universe", universe);
 		generationBody.put("sources", sources);
 		generationBody.put("nodes", nodes);
 		generationBody.put("edges", edges);
+		generationBody.put("diagnostics", diagnostics);
 
 		Map<String, Object> producer = map();
 		producer.put("name", PRODUCER);
@@ -157,7 +201,10 @@ public final class GraphSnapshotCommand {
 		capabilities.put("sourceDigests", true);
 		capabilities.put("diskDigests", true);
 		capabilities.put("unsavedBuffers", true);
+		capabilities.put("diagnostics", true);
 		capabilities.put("facts", List.of("contains"));
+		Map<String, Object> coverage = map();
+		coverage.put("contains", "complete");
 
 		Map<String, Object> snapshot = map();
 		snapshot.put("schemaVersion", SCHEMA_VERSION);
@@ -166,10 +213,14 @@ public final class GraphSnapshotCommand {
 		snapshot.put("capabilities", capabilities);
 		snapshot.put("universe", universe);
 		snapshot.put("generation", digestValue(generationBody));
+		snapshot.put("complete", diagnostics.stream().noneMatch(row -> "error".equals(row.get("severity"))));
+		snapshot.put("coverage", coverage);
+		snapshot.put("unresolved", List.of());
 		snapshot.put("projects", projects);
 		snapshot.put("sources", sources);
 		snapshot.put("nodes", nodes);
 		snapshot.put("edges", edges);
+		snapshot.put("diagnostics", diagnostics);
 		return snapshot;
 	}
 
@@ -208,8 +259,9 @@ public final class GraphSnapshotCommand {
 		return new ArrayList<>(units.values());
 	}
 
-	private static void captureUnit(IJavaProject project, ICompilationUnit unit, List<Map<String, Object>> sources,
-			List<Map<String, Object>> nodes, List<Map<String, Object>> edges, IProgressMonitor monitor) throws CoreException {
+	private static void captureUnit(IJavaProject project, ICompilationUnit unit, org.eclipse.jdt.core.dom.CompilationUnit ast,
+			List<Map<String, Object>> sources, List<Map<String, Object>> nodes, List<Map<String, Object>> edges,
+			List<Map<String, Object>> diagnostics, Set<String> emitted, IProgressMonitor monitor) throws CoreException {
 		unit.open(monitor);
 		IBuffer buffer = unit.getBuffer();
 		if (buffer == null) {
@@ -218,105 +270,271 @@ public final class GraphSnapshotCommand {
 		String content = buffer.getContents();
 		IResource resource = unit.getResource();
 		String uri = sourceUri(unit, resource);
-		Charset charset = sourceCharset(resource);
 		SourceText source = new SourceText(content);
 
 		Map<String, Object> sourceRow = map();
 		sourceRow.put("project", project.getElementName());
 		sourceRow.put("uri", uri);
-		sourceRow.put("checkerDigest", digest(content.getBytes(charset)));
+		sourceRow.put("checkerDigest", digestText(content));
+		sourceRow.put("checkerEncoding", "jdt-utf16-code-units-v1");
 		sourceRow.put("diskDigest", diskDigest(resource));
 		sources.add(sourceRow);
 
-		IType[] types = unit.getAllTypes();
-		Arrays.sort(types, Comparator.comparing(IJavaElement::getHandleIdentifier));
-		Set<String> emitted = new java.util.HashSet<>();
-		for (IType type : types) {
-			checkCanceled(monitor);
-			String typeSymbol = typeSymbol(project, type);
-			if (!emitted.add(typeSymbol)) {
-				continue;
-			}
-			Map<String, Object> typeNode = node(project, type, typeSymbol, typeKind(type), type.getElementName(),
-					type.getFullyQualifiedName('.'), "", source, uri);
-			if (typeNode == null) {
-				continue;
-			}
-			nodes.add(typeNode);
-			IType parent = type.getDeclaringType();
-			edges.add(contains(parent == null ? uri : typeSymbol(project, parent), typeSymbol, typeNode));
-			captureFields(project, type, typeSymbol, source, uri, emitted, nodes, edges);
-			captureMethods(project, type, typeSymbol, source, uri, emitted, nodes, edges);
+		captureAstDeclarations(project, ast, source, uri, emitted, nodes, edges, diagnostics);
+		for (IProblem problem : ast.getProblems()) {
+			Map<String, Object> row = map();
+			row.put("uri", uri);
+			row.put("severity", problem.isError() ? "error" : problem.isWarning() ? "warning" : "information");
+			row.put("code", Integer.toString(problem.getID()));
+			row.put("message", problem.getMessage());
+			int start = Math.max(0, problem.getSourceStart());
+			int end = Math.max(start, problem.getSourceEnd() + 1);
+			row.put("evidence", source.evidence(uri, start, end));
+			diagnostics.add(row);
 		}
 	}
 
-	private static void captureFields(IJavaProject project, IType type, String owner, SourceText source,
-			String uri, Set<String> emitted, List<Map<String, Object>> nodes, List<Map<String, Object>> edges) throws JavaModelException {
-		List<IField> fields = new ArrayList<>(Arrays.asList(type.getFields()));
-		fields.addAll(Arrays.asList(type.getRecordComponents()));
-		fields.sort(Comparator.comparing(IJavaElement::getHandleIdentifier));
-		for (IField field : fields) {
-			String signature = canonicalType(type, field.getTypeSignature());
-			String symbol = owner + "/field/" + field.getElementName();
-			if (!emitted.add(symbol)) {
-				continue;
+	private static void captureAstDeclarations(IJavaProject project, org.eclipse.jdt.core.dom.CompilationUnit ast,
+			SourceText source, String uri, Set<String> emitted, List<Map<String, Object>> nodes,
+			List<Map<String, Object>> edges, List<Map<String, Object>> diagnostics) {
+		String fileSymbol = "java/" + project.getElementName() + "/file/" + digest(uri.getBytes(StandardCharsets.UTF_8));
+		Map<String, Object> fileNode = astNode(project, fileSymbol, fileSymbol, "persistent", uri, fileName(uri), uri,
+				"file", "", "file", 0, source.evidence(uri, 0, source.length));
+		emitted.add(fileSymbol);
+		nodes.add(fileNode);
+		Map<String, String> displays = new TreeMap<>();
+		displays.put(fileSymbol, uri);
+
+		ast.accept(new ASTVisitor() {
+			private final Map<ASTNode, String> owners = new java.util.IdentityHashMap<>();
+			private final Map<String, Integer> occurrences = new TreeMap<>();
+			private String topOwner = fileSymbol;
+
+			@Override
+			public void preVisit(ASTNode node) {
+				if (node instanceof PackageDeclaration declaration) {
+					String name = declaration.getName().getFullyQualifiedName();
+					String symbol = "java/" + project.getElementName() + "/package/" + name;
+					add(node, symbol, declaration.resolveBinding(), "persistent", name, name, "package", "", "package", declaration, topOwner);
+					topOwner = symbol;
+				} else if (node instanceof ModuleDeclaration declaration) {
+					String name = declaration.getName().getFullyQualifiedName();
+					String symbol = "java/" + project.getElementName() + "/module/" + name;
+					add(node, symbol, declaration.resolveBinding(), "persistent", name, name, "module", "", "module", declaration, fileSymbol);
+					topOwner = symbol;
+				} else if (node instanceof AbstractTypeDeclaration declaration) {
+					ITypeBinding binding = declaration.resolveBinding();
+					String name = declaration.getName().getIdentifier();
+					boolean local = binding != null && binding.isLocal();
+					String binary = binding == null ? "" : nullToEmpty(binding.getBinaryName());
+					String owner = ownerOf(node);
+					String symbol = !local && !binary.isEmpty()
+							? "java/" + project.getElementName() + "/type/" + binary
+							: unique(owner + "/local-type/" + name);
+					String qualified = binding == null ? name : nullToEmpty(binding.getQualifiedName());
+					String declarationKind = declaration instanceof AnnotationTypeDeclaration ? "annotation"
+							: declaration instanceof RecordDeclaration ? "record"
+							: declaration instanceof EnumDeclaration ? "enum" : "type";
+					String kind = declaration instanceof AnnotationTypeDeclaration ? "interface"
+							: declaration instanceof EnumDeclaration ? "enum"
+							: declaration instanceof TypeDeclaration typed && typed.isInterface() ? "interface" : "class";
+					add(node, symbol, binding, local ? "structural" : "persistent", name,
+							qualified.isEmpty() ? displayOwner(node) + "." + name : qualified, kind, "", declarationKind, declaration, owner);
+				} else if (node instanceof AnonymousClassDeclaration declaration) {
+					ITypeBinding binding = declaration.resolveBinding();
+					String owner = ownerOf(node);
+					String base = owner + "/anonymous/" + anonymousBase(binding);
+					String symbol = unique(base);
+					add(node, symbol, binding, "structural", "<anonymous>", displayOwner(node) + ".<anonymous>",
+							"class", "", "anonymous-class", declaration, owner);
+				} else if (node instanceof MethodDeclaration declaration) {
+					IMethodBinding binding = declaration.resolveBinding();
+					String owner = ownerOf(node);
+					boolean constructor = declaration.isConstructor();
+					String name = constructor ? ownerSimpleName(node) : declaration.getName().getIdentifier();
+					String signature = methodSignature(binding, declaration);
+					String parameters = parameterSignature(binding, declaration);
+					String symbol = owner + "/" + (constructor ? "constructor" : "method") + "/" + name + parameters;
+					String declarationKind = declaration.getParent() instanceof AnnotationTypeDeclaration ? "annotation-element" : constructor ? "constructor" : "method";
+					add(node, symbol, binding, "persistent", name, displayOwner(node) + "." + name,
+							constructor ? "constructor" : "method", signature, declarationKind, declaration, owner);
+				} else if (node instanceof AnnotationTypeMemberDeclaration declaration) {
+					IMethodBinding binding = declaration.resolveBinding();
+					String owner = ownerOf(node);
+					String name = declaration.getName().getIdentifier();
+					String signature = binding == null ? "():" + declaration.getType() : "():" + canonicalType(binding.getReturnType());
+					String symbol = owner + "/annotation-element/" + name + "()";
+					add(node, symbol, binding, "persistent", name, displayOwner(node) + "." + name,
+							"method", signature, "annotation-element", declaration, owner);
+				} else if (node instanceof EnumConstantDeclaration declaration) {
+					IVariableBinding binding = declaration.resolveVariable();
+					String owner = ownerOf(node);
+					String name = declaration.getName().getIdentifier();
+					String symbol = owner + "/enum-constant/" + name;
+					add(node, symbol, binding, "persistent", name, displayOwner(node) + "." + name,
+							"field", binding == null ? "" : canonicalType(binding.getType()), "enum-constant", declaration, owner);
+				} else if (node instanceof VariableDeclaration declaration) {
+					IVariableBinding binding = declaration.resolveBinding();
+					String owner = ownerOf(node);
+					String name = declaration.getName().getIdentifier();
+					String declarationKind = variableKind(declaration, binding);
+					String kind = "parameter".equals(declarationKind) ? "parameter"
+							: Set.of("field", "record-component").contains(declarationKind) ? "field" : "variable";
+					String type = binding == null ? "" : canonicalType(binding.getType());
+					String base = owner + "/" + declarationKind + "/" + name + (type.isEmpty() ? "" : ":" + type);
+					boolean stableMember = binding != null && binding.isField();
+					String symbol = stableMember ? base : unique(base);
+					add(node, symbol, binding, stableMember ? "persistent" : "structural", name,
+							displayOwner(node) + "." + name, kind, type, declarationKind, declaration, owner);
+				} else if (node instanceof TypeParameter parameter) {
+					ITypeBinding binding = parameter.resolveBinding();
+					String owner = ownerOf(node);
+					String name = parameter.getName().getIdentifier();
+					String symbol = owner + "/type-parameter/" + name;
+					add(node, symbol, binding, "persistent", name, displayOwner(node) + "." + name,
+							"type", parameter.typeBounds().toString(), "type-parameter", parameter, owner);
+				} else if (node instanceof LambdaExpression lambda) {
+					IMethodBinding binding = lambda.resolveMethodBinding();
+					String owner = ownerOf(node);
+					String header = lambda.parameters().stream().map(String::valueOf).reduce((left, right) -> left + "," + right).orElse("");
+					String symbol = unique(owner + "/lambda/(" + header + ")");
+					add(node, symbol, binding, "structural", "<lambda>", displayOwner(node) + ".<lambda>",
+							"function", methodSignature(binding, null), "lambda", lambda, owner);
+				}
 			}
-			Map<String, Object> fieldNode = node(project, field, symbol, "field", field.getElementName(),
-					type.getFullyQualifiedName('.') + "." + field.getElementName(), signature, source, uri);
-			if (fieldNode != null) {
-				nodes.add(fieldNode);
-				edges.add(contains(owner, symbol, fieldNode));
+
+			private void add(ASTNode ownerNode, String symbol, IBinding binding, String stability, String name,
+					String qualifiedName, String kind, String signature, String declarationKind, ASTNode evidenceNode, String owner) {
+				owners.put(ownerNode, symbol);
+				displays.put(symbol, qualifiedName);
+				if (binding == null) {
+					Map<String, Object> diagnostic = map();
+					diagnostic.put("uri", uri);
+					diagnostic.put("severity", "error");
+					diagnostic.put("code", "jdt-unresolved-declaration-binding");
+					diagnostic.put("message", "JDT could not resolve the " + declarationKind + " binding for " + name);
+					diagnostic.put("evidence", source.evidence(uri, evidenceNode.getStartPosition(),
+							evidenceNode.getStartPosition() + evidenceNode.getLength()));
+					diagnostics.add(diagnostic);
+				}
+				if (!emitted.add(symbol)) return;
+				String nativeKey = binding == null ? symbol : nullToEmpty(binding.getKey());
+				Map<String, Object> value = astNode(project, symbol, nativeKey.isEmpty() ? symbol : nativeKey, stability,
+						uri, name, qualifiedName, kind, signature, declarationKind, binding == null ? 0 : binding.getModifiers(),
+						source.evidence(uri, evidenceNode.getStartPosition(), evidenceNode.getStartPosition() + evidenceNode.getLength()));
+				nodes.add(value);
+				edges.add(contains(owner, symbol, value));
 			}
-		}
+
+			private String ownerOf(ASTNode node) {
+				for (ASTNode cursor = node.getParent(); cursor != null; cursor = cursor.getParent()) {
+					String owner = owners.get(cursor);
+					if (owner != null) return owner;
+				}
+				return topOwner;
+			}
+
+			private String displayOwner(ASTNode node) {
+				String owner = ownerOf(node);
+				return displays.getOrDefault(owner, owner);
+			}
+
+			private String ownerSimpleName(ASTNode node) {
+				String display = displayOwner(node);
+				int dot = display.lastIndexOf('.');
+				return dot < 0 ? display : display.substring(dot + 1);
+			}
+
+			private String unique(String base) {
+				int next = occurrences.merge(base, 1, Integer::sum);
+				return next == 1 ? base : base + "/duplicate-" + next;
+			}
+		});
 	}
 
-	private static void captureMethods(IJavaProject project, IType type, String owner, SourceText source,
-			String uri, Set<String> emitted, List<Map<String, Object>> nodes, List<Map<String, Object>> edges) throws JavaModelException {
-		IMethod[] methods = type.getMethods();
-		Arrays.sort(methods, Comparator.comparing(IJavaElement::getHandleIdentifier));
-		for (IMethod method : methods) {
-			List<String> parameters = Arrays.stream(method.getParameterTypes()).map(value -> canonicalType(type, value)).toList();
-			String returnType = method.isConstructor() ? "" : canonicalType(type, method.getReturnType());
-			String signature = "(" + String.join(",", parameters) + ")" + (returnType.isEmpty() ? "" : ":" + returnType);
-			String kind = method.isConstructor() ? "constructor" : "method";
-			String name = method.isConstructor() ? type.getElementName() : method.getElementName();
-			String symbol = owner + "/" + kind + "/" + name + "(" + String.join(",", parameters) + ")";
-			if (!emitted.add(symbol)) {
-				continue;
-			}
-			Map<String, Object> methodNode = node(project, method, symbol, kind, name,
-					type.getFullyQualifiedName('.') + "." + name, signature, source, uri);
-			if (methodNode != null) {
-				nodes.add(methodNode);
-				edges.add(contains(owner, symbol, methodNode));
-			}
-		}
-	}
-
-	private static Map<String, Object> node(IJavaProject project, IJavaElement element, String symbol,
-			String kind, String name, String qualifiedName, String signature, SourceText source, String uri) throws JavaModelException {
-		if (!(element instanceof org.eclipse.jdt.core.ISourceReference reference)) {
-			return null;
-		}
-		ISourceRange range = reference.getSourceRange();
-		if (range == null || range.getOffset() < 0 || range.getLength() < 0) {
-			return null;
-		}
-		int flags = element instanceof org.eclipse.jdt.core.IMember member ? member.getFlags() : 0;
+	private static Map<String, Object> astNode(IJavaProject project, String symbol, String nativeKey, String stability,
+			String uri, String name, String qualifiedName, String kind, String signature, String declarationKind,
+			int flags, Map<String, Object> evidence) {
 		Map<String, Object> answer = map();
 		answer.put("project", project.getElementName());
 		answer.put("symbol", symbol);
-		answer.put("nativeKey", element.getHandleIdentifier());
-		answer.put("stability", name.isEmpty() || qualifiedName.isEmpty() ? "generation" : "persistent");
+		answer.put("nativeKey", nativeKey);
+		answer.put("stability", stability);
 		answer.put("uri", uri);
 		answer.put("name", name);
 		answer.put("qualifiedName", qualifiedName);
 		answer.put("kind", kind);
 		answer.put("signature", signature);
-		answer.put("exported", Flags.isPublic(flags) || Flags.isProtected(flags));
+		answer.put("declarationKind", declarationKind);
+		answer.put("exported", org.eclipse.jdt.core.dom.Modifier.isPublic(flags) || org.eclipse.jdt.core.dom.Modifier.isProtected(flags));
 		answer.put("modifiers", modifiers(flags));
-		answer.put("evidence", source.evidence(uri, range));
+		answer.put("evidence", evidence);
 		return answer;
+	}
+
+	private static String fileName(String uri) {
+		try {
+			Path path = Path.of(URI.create(uri));
+			return path.getFileName() == null ? uri : path.getFileName().toString();
+		} catch (IllegalArgumentException exception) {
+			int slash = Math.max(uri.lastIndexOf('/'), uri.lastIndexOf('\\'));
+			return slash < 0 ? uri : uri.substring(slash + 1);
+		}
+	}
+
+	private static String anonymousBase(ITypeBinding binding) {
+		if (binding == null) return "unresolved";
+		ITypeBinding superclass = binding.getSuperclass();
+		if (superclass != null && !"java.lang.Object".equals(superclass.getQualifiedName())) {
+			return canonicalType(superclass);
+		}
+		ITypeBinding[] interfaces = binding.getInterfaces();
+		return interfaces.length == 0 ? "java.lang.Object" : canonicalType(interfaces[0]);
+	}
+
+	private static String methodSignature(IMethodBinding binding, MethodDeclaration declaration) {
+		String parameters = parameterSignature(binding, declaration);
+		if (binding != null) {
+			return parameters + (binding.isConstructor() ? "" : ":" + canonicalType(binding.getReturnType()));
+		}
+		if (declaration == null || declaration.isConstructor()) return parameters;
+		return parameters + ":" + declaration.getReturnType2();
+	}
+
+	private static String parameterSignature(IMethodBinding binding, MethodDeclaration declaration) {
+		if (binding != null) {
+			return "(" + Arrays.stream(binding.getParameterTypes()).map(GraphSnapshotCommand::canonicalType)
+					.reduce((left, right) -> left + "," + right).orElse("") + ")";
+		}
+		if (declaration == null) return "()";
+		return "(" + declaration.parameters().stream().map(String::valueOf)
+				.reduce((left, right) -> left + "," + right).orElse("") + ")";
+	}
+
+	private static String canonicalType(ITypeBinding binding) {
+		if (binding == null) return "";
+		if (binding.isArray()) return canonicalType(binding.getElementType()) + "[]".repeat(binding.getDimensions());
+		ITypeBinding declaration = binding.getErasure();
+		String qualified = nullToEmpty(declaration.getQualifiedName());
+		return qualified.isEmpty() ? declaration.getName() : qualified;
+	}
+
+	private static String variableKind(VariableDeclaration declaration, IVariableBinding binding) {
+		ASTNode parent = declaration.getParent();
+		if (parent instanceof RecordDeclaration record && record.recordComponents().contains(declaration)) {
+			return "record-component";
+		}
+		if (binding != null && binding.isEnumConstant()) return "enum-constant";
+		if (binding != null && binding.isField()) return "field";
+		if (declaration instanceof SingleVariableDeclaration &&
+				(parent instanceof MethodDeclaration || parent instanceof LambdaExpression)) {
+			return "parameter";
+		}
+		return "variable";
+	}
+
+	private static String nullToEmpty(String value) {
+		return value == null ? "" : value;
 	}
 
 	private static Map<String, Object> contains(String from, String to, Map<String, Object> target) {
@@ -326,37 +544,6 @@ public final class GraphSnapshotCommand {
 		edge.put("kind", "contains");
 		edge.put("evidence", target.get("evidence"));
 		return edge;
-	}
-
-	private static String typeSymbol(IJavaProject project, IType type) {
-		String binary = type.getFullyQualifiedName('$');
-		if (binary.isEmpty()) {
-			return "java/" + project.getElementName() + "/generation/" + type.getHandleIdentifier();
-		}
-		return "java/" + project.getElementName() + "/type/" + binary;
-	}
-
-	private static String typeKind(IType type) throws JavaModelException {
-		int flags = type.getFlags();
-		if (Flags.isAnnotation(flags)) return "interface";
-		if (Flags.isEnum(flags)) return "enum";
-		if (type.isInterface()) return "interface";
-		return "class";
-	}
-
-	private static String canonicalType(IType context, String rawSignature) {
-		String erased = Signature.getTypeErasure(rawSignature);
-		int dimensions = Signature.getArrayCount(erased);
-		String element = Signature.toString(Signature.getElementType(erased));
-		try {
-			String[][] resolved = context.resolveType(element);
-			if (resolved != null && resolved.length == 1) {
-				element = resolved[0][0].isEmpty() ? resolved[0][1] : resolved[0][0] + "." + resolved[0][1];
-			}
-		} catch (JavaModelException ignored) {
-			// The unresolved spelling is still stable and more truthful than a guess.
-		}
-		return element + "[]".repeat(dimensions);
 	}
 
 	private static List<String> modifiers(int flags) {
@@ -388,7 +575,7 @@ public final class GraphSnapshotCommand {
 			row.put("contentKind", entry.getContentKind());
 			row.put("exported", entry.isExported());
 			row.put("output", entry.getOutputLocation() == null ? "" : entry.getOutputLocation().toPortableString());
-			row.put("contentDigest", classpathDigest(entry.getPath(), monitor));
+			row.put("contentDigest", classpathDigest(entry, monitor));
 			List<String> attributes = Arrays.stream(entry.getExtraAttributes())
 					.sorted(Comparator.comparing(IClasspathAttribute::getName).thenComparing(IClasspathAttribute::getValue))
 					.map(attribute -> attribute.getName() + "=" + attribute.getValue()).toList();
@@ -401,7 +588,25 @@ public final class GraphSnapshotCommand {
 		return metadata;
 	}
 
-	private static String classpathDigest(org.eclipse.core.runtime.IPath entryPath, IProgressMonitor monitor) throws CoreException {
+	private static String classpathDigest(IClasspathEntry entry, IProgressMonitor monitor) throws CoreException {
+		org.eclipse.core.runtime.IPath entryPath = entry.getPath();
+		if (entry.getEntryKind() == IClasspathEntry.CPE_SOURCE) {
+			return digest(("source-root:" + entryPath.toPortableString()).getBytes(StandardCharsets.UTF_8));
+		}
+		if (entry.getEntryKind() == IClasspathEntry.CPE_PROJECT) {
+			IResource dependency = ResourcesPlugin.getWorkspace().getRoot().findMember(entryPath);
+			if (dependency != null) {
+				IJavaProject javaProject = JavaCore.create(dependency.getProject());
+				if (javaProject.exists()) {
+					return pathDigest(javaProject.getOutputLocation(), monitor);
+				}
+			}
+			return digest(("missing-project:" + entryPath.toPortableString()).getBytes(StandardCharsets.UTF_8));
+		}
+		return pathDigest(entryPath, monitor);
+	}
+
+	private static String pathDigest(org.eclipse.core.runtime.IPath entryPath, IProgressMonitor monitor) throws CoreException {
 		IResource resource = ResourcesPlugin.getWorkspace().getRoot().findMember(entryPath);
 		Path path = resource != null && resource.getLocation() != null ? resource.getLocation().toFile().toPath() : entryPath.toFile().toPath();
 		if (!Files.exists(path)) {
@@ -444,10 +649,6 @@ public final class GraphSnapshotCommand {
 			}
 		}
 		return HexFormat.of().formatHex(hash.digest());
-	}
-
-	private static Charset sourceCharset(IResource resource) throws CoreException {
-		return resource instanceof IFile file ? Charset.forName(file.getCharset(true)) : StandardCharsets.UTF_8;
 	}
 
 	private static String sourceUri(ICompilationUnit unit, IResource resource) {
@@ -512,6 +713,18 @@ public final class GraphSnapshotCommand {
 		return HexFormat.of().formatHex(newDigest().digest(bytes));
 	}
 
+	/** Hashes the exact UTF-16 code units JDT reconciled, without replacement. */
+	private static String digestText(String text) {
+		MessageDigest hash = newDigest();
+		update(hash, "jdt-utf16-code-units-v1");
+		for (int index = 0; index < text.length(); index++) {
+			char value = text.charAt(index);
+			hash.update((byte) (value >>> 8));
+			hash.update((byte) value);
+		}
+		return HexFormat.of().formatHex(hash.digest());
+	}
+
 	private static MessageDigest newDigest() {
 		try {
 			return MessageDigest.getInstance(SHA_256);
@@ -538,8 +751,10 @@ public final class GraphSnapshotCommand {
 
 	private static final class SourceText {
 		private final int[] starts;
+		private final int length;
 
 		SourceText(String content) {
+			this.length = content.length();
 			List<Integer> lines = new ArrayList<>();
 			lines.add(0);
 			for (int index = 0; index < content.length(); index++) {
@@ -549,8 +764,12 @@ public final class GraphSnapshotCommand {
 		}
 
 		Map<String, Object> evidence(String uri, ISourceRange range) {
-			int start = Math.max(0, range.getOffset());
-			int end = Math.max(start, start + range.getLength());
+			return evidence(uri, range.getOffset(), range.getOffset() + range.getLength());
+		}
+
+		Map<String, Object> evidence(String uri, int rawStart, int rawEnd) {
+			int start = Math.min(length, Math.max(0, rawStart));
+			int end = Math.min(length, Math.max(start, rawEnd));
 			int startLine = line(start);
 			int endLine = line(end);
 			Map<String, Object> answer = map();

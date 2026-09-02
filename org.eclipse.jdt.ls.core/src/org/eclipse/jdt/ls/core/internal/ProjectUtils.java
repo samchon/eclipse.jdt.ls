@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.locks.Lock;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -658,6 +659,16 @@ public final class ProjectUtils {
 	 * @throws JavaModelException
 	 */
 	public static void refreshDiagnostics(IProgressMonitor monitor) throws JavaModelException {
+		Lock lock = GraphSnapshotLock.writeLock();
+		lock.lock();
+		try {
+			refreshDiagnosticsLocked(monitor);
+		} finally {
+			lock.unlock();
+		}
+	}
+
+	private static void refreshDiagnosticsLocked(IProgressMonitor monitor) throws JavaModelException {
 		if (JavaLanguageServerPlugin.getInstance().getProtocol() != null && JavaLanguageServerPlugin.getInstance().getProtocol().getClientConnection() != null) {
 			for (ICompilationUnit unit : JavaCore.getWorkingCopies(null)) {
 				IPath path = unit.getPath();
