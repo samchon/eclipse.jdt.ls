@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.locks.Lock;
 import java.util.stream.Stream;
 
 import org.eclipse.core.resources.IResource;
@@ -36,6 +37,7 @@ import org.eclipse.jdt.internal.corext.refactoring.rename.RenamePackageProcessor
 import org.eclipse.jdt.internal.corext.refactoring.reorg.IReorgDestination;
 import org.eclipse.jdt.internal.corext.refactoring.reorg.ReorgDestinationFactory;
 import org.eclipse.jdt.ls.core.internal.ChangeUtil;
+import org.eclipse.jdt.ls.core.internal.GraphSnapshotLock;
 import org.eclipse.jdt.ls.core.internal.JDTUtils;
 import org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin;
 import org.eclipse.jdt.ls.core.internal.ProjectUtils;
@@ -216,26 +218,33 @@ public class FileEventHandler {
 
 		WorkspaceEdit[] root = new WorkspaceEdit[1];
 		if (cus.length > 0) {
+			Lock lock = GraphSnapshotLock.writeLock();
+			lock.lock();
 			try {
-				// For the cu that's not on the project's classpath, need to become workingcopy first,
-				// otherwise invoking cu.getBuffer() will throw exception.
-				for (ICompilationUnit cu : nonClasspathCus) {
-					cu.becomeWorkingCopy(monitor);
-				}
-				IReorgDestination packageDestination = ReorgDestinationFactory.createDestination(destinationPackage);
-				ResourcesPlugin.getWorkspace().run((pm) -> {
-					root[0] = MoveHandler.move(new IResource[0], cus, packageDestination, true, pm);
-				}, monitor);
-			} catch (CoreException e) {
-				JavaLanguageServerPlugin.logException("Failed to compute the move update", e);
-			} finally {
-				for (ICompilationUnit cu : nonClasspathCus) {
-					try {
-						cu.discardWorkingCopy();
-					} catch (JavaModelException e) {
-						// do nothing
+				GraphSnapshotLock.assertWriteLocked();
+				try {
+					// For the cu that's not on the project's classpath, need to become workingcopy first,
+					// otherwise invoking cu.getBuffer() will throw exception.
+					for (ICompilationUnit cu : nonClasspathCus) {
+						cu.becomeWorkingCopy(monitor);
+					}
+					IReorgDestination packageDestination = ReorgDestinationFactory.createDestination(destinationPackage);
+					ResourcesPlugin.getWorkspace().run((pm) -> {
+						root[0] = MoveHandler.move(new IResource[0], cus, packageDestination, true, pm);
+					}, monitor);
+				} catch (CoreException e) {
+					JavaLanguageServerPlugin.logException("Failed to compute the move update", e);
+				} finally {
+					for (ICompilationUnit cu : nonClasspathCus) {
+						try {
+							cu.discardWorkingCopy();
+						} catch (JavaModelException e) {
+							// do nothing
+						}
 					}
 				}
+			} finally {
+				lock.unlock();
 			}
 		}
 

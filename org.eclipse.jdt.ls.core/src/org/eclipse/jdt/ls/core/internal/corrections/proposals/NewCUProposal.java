@@ -22,6 +22,7 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.locks.Lock;
 
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.jdt.core.Flags;
@@ -59,6 +60,7 @@ import org.eclipse.jdt.internal.corext.fix.UnimplementedCodeFixCore;
 import org.eclipse.jdt.internal.corext.refactoring.nls.changes.CreateFileChange;
 import org.eclipse.jdt.internal.corext.util.JavaModelUtil;
 import org.eclipse.jdt.internal.corext.util.Messages;
+import org.eclipse.jdt.ls.core.internal.GraphSnapshotLock;
 import org.eclipse.jdt.ls.core.internal.corrections.CorrectionMessages;
 import org.eclipse.ltk.core.refactoring.Change;
 import org.eclipse.ltk.core.refactoring.CompositeChange;
@@ -431,24 +433,33 @@ public class NewCUProposal extends ChangeCorrectionProposalCore {
 		boolean isPermitted = Arrays.asList(permittedNames).contains(fTypeNameWithParameters);
 
 		if (isPermitted && fTypeKind != K_INTERFACE) {
-			cu.becomeWorkingCopy(null);
-			cu.getBuffer().setContents(cuContent);
+			Lock lock = GraphSnapshotLock.writeLock();
+			lock.lock();
+			try {
+				GraphSnapshotLock.assertWriteLocked();
+				cu.becomeWorkingCopy(null);
+				try {
+					cu.getBuffer().setContents(cuContent);
 
-			ASTParser parser = ASTParser.newParser(IASTSharedValues.SHARED_AST_LEVEL);
-			parser.setSource(cu);
-			parser.setResolveBindings(true);
-			CompilationUnit cuNode = (CompilationUnit) parser.createAST(null);
+					ASTParser parser = ASTParser.newParser(IASTSharedValues.SHARED_AST_LEVEL);
+					parser.setSource(cu);
+					parser.setResolveBindings(true);
+					CompilationUnit cuNode = (CompilationUnit) parser.createAST(null);
 
-			if (!cuNode.types().isEmpty()) {
-				AddUnimplementedMethodsOperation operation = new AddUnimplementedMethodsOperation((ASTNode) cuNode.types().get(0), null);
-				if (operation.getMethodsToImplement().length > 0) {
-					IProposableFix fix = new UnimplementedCodeFixCore(CorrectionMessages.UnimplementedMethodsCorrectionProposal_description, cuNode, new CompilationUnitRewriteOperation[] { operation });
-					CompilationUnitChange addUnimplementedChange = fix.createChange(null);
-					cuContent = addUnimplementedChange.getPreviewContent(null);
+					if (!cuNode.types().isEmpty()) {
+						AddUnimplementedMethodsOperation operation = new AddUnimplementedMethodsOperation((ASTNode) cuNode.types().get(0), null);
+						if (operation.getMethodsToImplement().length > 0) {
+							IProposableFix fix = new UnimplementedCodeFixCore(CorrectionMessages.UnimplementedMethodsCorrectionProposal_description, cuNode, new CompilationUnitRewriteOperation[] { operation });
+							CompilationUnitChange addUnimplementedChange = fix.createChange(null);
+							cuContent = addUnimplementedChange.getPreviewContent(null);
+						}
+					}
+				} finally {
+					cu.discardWorkingCopy();
 				}
+			} finally {
+				lock.unlock();
 			}
-
-			cu.discardWorkingCopy();
 		}
 
 		cuChange.setEdit(new InsertEdit(0, cuContent));
