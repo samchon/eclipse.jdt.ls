@@ -267,6 +267,7 @@ public final class GraphSnapshotCommand {
 		parser.setResolveBindings(true);
 		parser.setBindingsRecovery(true);
 		parser.setStatementsRecovery(true);
+		parser.setForceProblemDetection(true);
 		return (org.eclipse.jdt.core.dom.CompilationUnit) parser.createAST(monitor);
 	}
 
