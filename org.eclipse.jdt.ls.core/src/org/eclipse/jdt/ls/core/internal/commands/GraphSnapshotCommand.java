@@ -58,6 +58,7 @@ import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.compiler.IProblem;
 import org.eclipse.jdt.core.dom.AST;
 import org.eclipse.jdt.core.dom.ASTNode;
+import org.eclipse.jdt.core.dom.ASTParser;
 import org.eclipse.jdt.core.dom.ASTVisitor;
 import org.eclipse.jdt.core.dom.AbstractTypeDeclaration;
 import org.eclipse.jdt.core.dom.AnnotationTypeDeclaration;
@@ -85,7 +86,8 @@ import org.osgi.framework.FrameworkUtil;
 /**
  * Exports one compiler-owned Java-model generation without per-declaration LSP
  * requests. The workspace root rule freezes resource state while the command
- * reconciles resident working copies and walks the Java model once.
+ * parses each primary-owner working copy once with binding resolution and walks
+ * the Java model once.
  */
 public final class GraphSnapshotCommand {
 
@@ -164,9 +166,9 @@ public final class GraphSnapshotCommand {
 				ICompilationUnit resident = workingCopies.get(unitKey(primary));
 				ICompilationUnit unit = resident == null ? primary.getWorkingCopy(monitor) : resident;
 				try {
-					org.eclipse.jdt.core.dom.CompilationUnit ast = unit.reconcile(AST.getJLSLatest(), true, null, monitor);
+					org.eclipse.jdt.core.dom.CompilationUnit ast = semanticAst(unit, monitor);
 					if (ast == null) {
-						throw failure("JDT did not reconcile " + unit.getPath().toPortableString(), null);
+						throw failure("JDT did not parse " + unit.getPath().toPortableString(), null);
 					}
 					captureUnit(project, unit, ast, sources, nodes, edges, diagnostics, emittedNodes, monitor);
 				} finally {
@@ -256,6 +258,16 @@ public final class GraphSnapshotCommand {
 			}
 		}
 		return new ArrayList<>(units.values());
+	}
+
+	private static org.eclipse.jdt.core.dom.CompilationUnit semanticAst(
+			ICompilationUnit unit, IProgressMonitor monitor) {
+		ASTParser parser = ASTParser.newParser(AST.getJLSLatest());
+		parser.setSource(unit);
+		parser.setResolveBindings(true);
+		parser.setBindingsRecovery(true);
+		parser.setStatementsRecovery(true);
+		return (org.eclipse.jdt.core.dom.CompilationUnit) parser.createAST(monitor);
 	}
 
 	private static void captureUnit(IJavaProject project, ICompilationUnit unit, org.eclipse.jdt.core.dom.CompilationUnit ast,
