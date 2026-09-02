@@ -30,9 +30,10 @@ import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IAccessRule;
 import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.IJavaProject;
+import org.eclipse.jdt.core.IPackageFragment;
+import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.ls.core.internal.GraphSnapshotLock;
-import org.eclipse.jdt.ls.core.internal.WorkspaceHelper;
 import org.eclipse.jdt.ls.core.internal.handlers.WorkspaceExecuteCommandHandler;
 import org.eclipse.jdt.ls.core.internal.managers.AbstractProjectsManagerBasedTest;
 import org.junit.jupiter.api.Test;
@@ -41,13 +42,14 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 
 	@Test
 	public void exportsFrozenWorkspaceGenerationIncludingResidentChanges() throws Exception {
-		importProjects("maven/salut2");
-		IProject project = WorkspaceHelper.getProject("salut2");
-		IJavaProject javaProject = JavaCore.create(project);
+		IJavaProject javaProject = newEmptyProject();
 		javaProject.setOption(JavaCore.COMPILER_SOURCE, JavaCore.VERSION_21);
 		javaProject.setOption(JavaCore.COMPILER_COMPLIANCE, JavaCore.VERSION_21);
+		javaProject.setOption(JavaCore.COMPILER_CODEGEN_TARGET_PLATFORM, JavaCore.VERSION_21);
+		ICompilationUnit unit = createUnit(javaProject, "package foo;\n\npublic class Bar {}\n");
 		assertTrue(WorkspaceExecuteCommandHandler.getInstance().getAllCommands().contains(GraphSnapshotCommand.COMMAND_ID));
 		Map<String, Object> first = GraphSnapshotCommand.execute(monitor);
+		assertEquals(true, first.get("complete"), rows(first, "diagnostics").toString());
 		assertEquals(GraphSnapshotCommand.SCHEMA_VERSION, first.get("schemaVersion"));
 		assertEquals(GraphSnapshotCommand.PROTOCOL_VERSION, first.get("protocolVersion"));
 		assertFalse(rows(first, "sources").isEmpty());
@@ -59,9 +61,8 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 		assertEquals("unchanged", unchanged.get("mode"));
 		assertEquals(first.get("sequence"), unchanged.get("sequence"));
 
-		IFile file = project.getFile("src/main/java/foo/Bar.java");
+		IFile file = (IFile) unit.getResource();
 		file.setCharset(StandardCharsets.US_ASCII.name(), monitor);
-		ICompilationUnit unit = JavaCore.createCompilationUnitFrom(file);
 		unit.becomeWorkingCopy(monitor);
 		try {
 			String disk = unit.getBuffer().getContents();
@@ -132,17 +133,17 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 
 	@Test
 	public void savedSourceEditMovesGenerationButNotBuildUniverse() throws Exception {
-		importProjects("maven/salut2");
-		IFile file = WorkspaceHelper.getProject("salut2").getFile("src/main/java/foo/Bar.java");
-		String original;
-		try (var input = file.getContents()) {
-			original = new String(input.readAllBytes(), StandardCharsets.UTF_8);
-		}
+		IJavaProject javaProject = newEmptyProject();
+		String original = "package foo;\n\npublic class Bar {}\n";
+		ICompilationUnit unit = createUnit(javaProject, original);
+		IFile file = (IFile) unit.getResource();
 		Map<String, Object> first = GraphSnapshotCommand.execute(monitor);
+		assertEquals(true, first.get("complete"), rows(first, "diagnostics").toString());
 		try {
 			String edited = original + "\nclass SavedBodyEdit {}\n";
 			file.setContents(new ByteArrayInputStream(edited.getBytes(StandardCharsets.UTF_8)), true, false, monitor);
 			Map<String, Object> changed = GraphSnapshotCommand.execute(monitor);
+			assertEquals(true, changed.get("complete"), rows(changed, "diagnostics").toString());
 			assertEquals(first.get("universe"), changed.get("universe"));
 			assertNotEquals(first.get("generation"), changed.get("generation"));
 			assertEquals("incremental", changed.get("mode"));
@@ -160,9 +161,8 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 
 	@Test
 	public void classpathAccessRulesMoveTheBuildUniverse() throws Exception {
-		importProjects("maven/salut2");
-		IProject project = WorkspaceHelper.getProject("salut2");
-		IJavaProject javaProject = JavaCore.create(project);
+		IJavaProject javaProject = newEmptyProject();
+		IProject project = javaProject.getProject();
 		java.nio.file.Path library = project.getLocation().append("lib/access-rules.jar").toFile().toPath();
 		java.nio.file.Files.createDirectories(library.getParent());
 		try (JarOutputStream ignored = new JarOutputStream(java.nio.file.Files.newOutputStream(library))) {
@@ -186,6 +186,8 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 				libraryEntry(library, "public/**", IAccessRule.K_DISCOURAGED, true);
 		javaProject.setRawClasspath(withLibrary, monitor);
 		Map<String, Object> ignoreChanged = GraphSnapshotCommand.execute(monitor);
+		assertEquals(true, baseline.get("complete"), rows(baseline, "diagnostics").toString());
+		assertEquals(true, ignoreChanged.get("complete"), rows(ignoreChanged, "diagnostics").toString());
 		assertNotEquals(baseline.get("universe"), patternChanged.get("universe"));
 		assertNotEquals(patternChanged.get("universe"), kindChanged.get("universe"));
 		assertNotEquals(kindChanged.get("universe"), ignoreChanged.get("universe"));
@@ -203,28 +205,22 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 
 	@Test
 	public void projectClasspathCombinationMovesTheBuildUniverse() throws Exception {
-		importProjects("maven/multimodule");
-		IJavaProject javaProject =
-				Arrays.stream(JavaCore.create(WorkspaceHelper.getWorkspaceRoot()).getJavaProjects())
-						.filter(project -> {
-							try {
-								return Arrays.stream(project.getRawClasspath())
-										.anyMatch(entry -> entry.getEntryKind() == IClasspathEntry.CPE_PROJECT);
-							} catch (org.eclipse.jdt.core.JavaModelException exception) {
-								return false;
-							}
-						})
-						.findFirst()
-						.orElseThrow();
+		IJavaProject dependency = newEmptyProject("GraphDependency");
+		IJavaProject javaProject = newEmptyProject("GraphConsumer");
 		IClasspathEntry[] original = javaProject.getRawClasspath();
-		int index =
-				java.util.stream.IntStream.range(0, original.length)
-						.filter(value -> original[value].getEntryKind() == IClasspathEntry.CPE_PROJECT)
-						.findFirst()
-						.orElseThrow();
+		IClasspathEntry[] withProject = Arrays.copyOf(original, original.length + 1);
+		int index = original.length;
+		withProject[index] = JavaCore.newProjectEntry(
+				dependency.getPath(),
+				new IAccessRule[0],
+				true,
+				new org.eclipse.jdt.core.IClasspathAttribute[0],
+				false);
+		javaProject.setRawClasspath(withProject, monitor);
 		Map<String, Object> first = GraphSnapshotCommand.execute(monitor);
-		IClasspathEntry projectEntry = original[index];
-		IClasspathEntry[] changed = Arrays.copyOf(original, original.length);
+		assertEquals(true, first.get("complete"), rows(first, "diagnostics").toString());
+		IClasspathEntry projectEntry = withProject[index];
+		IClasspathEntry[] changed = Arrays.copyOf(withProject, withProject.length);
 		changed[index] =
 				JavaCore.newProjectEntry(
 						projectEntry.getPath(),
@@ -235,6 +231,13 @@ public class GraphSnapshotCommandTest extends AbstractProjectsManagerBasedTest {
 		javaProject.setRawClasspath(changed, monitor);
 		Map<String, Object> second = GraphSnapshotCommand.execute(monitor);
 		assertNotEquals(first.get("universe"), second.get("universe"));
+	}
+
+	private ICompilationUnit createUnit(IJavaProject javaProject, String source) throws Exception {
+		IPackageFragmentRoot sourceFolder =
+				javaProject.getPackageFragmentRoot(javaProject.getProject().getFolder("src"));
+		IPackageFragment packageFragment = sourceFolder.createPackageFragment("foo", false, monitor);
+		return packageFragment.createCompilationUnit("Bar.java", source, false, monitor);
 	}
 
 	private static IClasspathEntry libraryEntry(

@@ -53,7 +53,6 @@ import org.eclipse.jdt.core.IJavaModel;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IPackageFragment;
 import org.eclipse.jdt.core.IPackageFragmentRoot;
-import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.compiler.IProblem;
@@ -511,8 +510,11 @@ public final class GraphSnapshotCommand {
 					.reduce((left, right) -> left + "," + right).orElse("") + ")";
 		}
 		if (declaration == null) return "()";
-		return "(" + declaration.parameters().stream().map(String::valueOf)
-				.reduce((left, right) -> left + "," + right).orElse("") + ")";
+		List<String> parameters = new ArrayList<>();
+		for (Object parameter : declaration.parameters()) {
+			parameters.add(String.valueOf(parameter));
+		}
+		return "(" + String.join(",", parameters) + ")";
 	}
 
 	private static String canonicalType(ITypeBinding binding) {
@@ -771,10 +773,6 @@ public final class GraphSnapshotCommand {
 				if (content.charAt(index) == '\n') lines.add(index + 1);
 			}
 			this.starts = lines.stream().mapToInt(Integer::intValue).toArray();
-		}
-
-		Map<String, Object> evidence(String uri, ISourceRange range) {
-			return evidence(uri, range.getOffset(), range.getOffset() + range.getLength());
 		}
 
 		Map<String, Object> evidence(String uri, int rawStart, int rawEnd) {
