@@ -393,15 +393,15 @@ public final class GraphSnapshotCommand {
 					String symbol = owner + "/type-parameter/" + name;
 					add(node, symbol, binding, "persistent", name, displayOwner(node) + "." + name,
 							"type", parameter.typeBounds().toString(), "type-parameter", parameter, owner);
-			} else if (node instanceof LambdaExpression lambda) {
-				IMethodBinding binding = lambda.resolveMethodBinding();
-				String owner = ownerOf(node);
-				List<String> parameterTexts = new ArrayList<>();
-				for (Object parameter : lambda.parameters()) {
-					parameterTexts.add(String.valueOf(parameter));
-				}
-				String header = String.join(",", parameterTexts);
-				String symbol = unique(owner + "/lambda/(" + header + ")");
+				} else if (node instanceof LambdaExpression lambda) {
+					IMethodBinding binding = lambda.resolveMethodBinding();
+					String owner = ownerOf(node);
+					List<String> parameterTexts = new ArrayList<>();
+					for (Object parameter : lambda.parameters()) {
+						parameterTexts.add(String.valueOf(parameter));
+					}
+					String header = String.join(",", parameterTexts);
+					String symbol = unique(owner + "/lambda/(" + header + ")");
 					add(node, symbol, binding, "structural", "<lambda>", displayOwner(node) + ".<lambda>",
 							"function", methodSignature(binding, null), "lambda", lambda, owner);
 				}
